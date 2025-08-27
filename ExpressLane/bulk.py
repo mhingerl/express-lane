@@ -18,7 +18,7 @@ from scipy.cluster.hierarchy import linkage, cut_tree, leaves_list
 from scipy.spatial.distance import pdist
 from scipy.stats import zscore
 from typing import Dict, List, Tuple, Optional, Any
-from .adjustTextfork import adjust_text
+from adjustText import adjust_text
 from gprofiler import GProfiler
 import matplotlib.colors as mcolors
 from scipy.stats import sem
@@ -922,7 +922,8 @@ def plot_cluster_curve(
     condition: str = None,
     plot_points: bool = False,
     figure_size: tuple = (7, 5),
-    save_plot: bool = True
+    save_plot: bool = True,
+    plot_formats: List[str]=["png"]
 ):
     """
     Plots gene expression over time, handling variable numbers of replicates per timepoint.
@@ -1012,10 +1013,9 @@ def plot_cluster_curve(
     if save_plot:
         save_dir = "figures/cluster_curves"
         os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, f"curve_{plot_name}_{genes_to_plot[0]}_{len(genes_to_plot)}.png")
-        plt.savefig(filename, dpi=300)
-        filename = os.path.join(save_dir, f"curve_{plot_name}_{genes_to_plot[0]}_{len(genes_to_plot)}.svg")
-        plt.savefig(filename)
+        for plot_format in plot_formats:
+            filename = os.path.join(save_dir, f"curve_{plot_name}_{genes_to_plot[0]}_{len(genes_to_plot)}.{plot_format}")
+            plt.savefig(filename, dpi=300)
         print(f"Plot saved to {filename}")
         
     plt.show()

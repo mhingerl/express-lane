@@ -7,6 +7,19 @@ setup(
     author_email='maximilian.hignerl@gmail.com',
     description='A short description of my package',
     packages=find_packages(), 
+    install_requires=[
+        'pandas',
+        'numpy',
+        'matplotlib',
+        'seaborn',
+        'PyComplexHeatmap',
+        'gseapy',
+        'scanpy',
+        'pytximport',
+        'sanbomics',
+        'pydeseq2',
+        'adjustText @ git+https://github.com/mhingerl/adjustText.git'
+    ],
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',
