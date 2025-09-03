@@ -18,7 +18,9 @@ setup(
         'pytximport',
         'sanbomics',
         'pydeseq2',
-        'adjustText @ git+https://github.com/mhingerl/adjustText.git'
+        'adjustText @ git+https://github.com/mhingerl/adjustText.git',
+        'openpyxl',
+        'pkg_resources'
     ],
     classifiers=[
         'Programming Language :: Python :: 3',

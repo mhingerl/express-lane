@@ -23,6 +23,7 @@ from gprofiler import GProfiler
 import matplotlib.colors as mcolors
 from scipy.stats import sem
 from matplotlib.colors import LinearSegmentedColormap
+from venn import generate_petal_labels, draw_venn, generate_colors
 
 def custom_slicer(df, initial_rows=50, block_size=50, step = 3):
   """
@@ -68,7 +69,7 @@ def wrap_text_by_words(text, words_per_line=2):
 
 def _run_deseq_analysis(counts_df, metadata, design_formula, contrast_design, ref_condition):
     """Sets up and runs the full DESeq2 analysis pipeline."""
-    inference = DefaultInference(n_cpus=8)
+    inference = DefaultInference(n_cpus=20)
     dds = DeseqDataSet(
         counts=counts_df,
         metadata=metadata,
@@ -97,21 +98,27 @@ def _run_deseq_analysis(counts_df, metadata, design_formula, contrast_design, re
     return dds, res_dict, contrast_design
 
 
-def _get_significant_genes(res_dict, p_value_cutoff, p_value_col, log2fc_cutoff, contrast_design, primary_column_order, display_top_genes):
+def _get_significant_genes(res_dict, 
+                           p_value_cutoff, 
+                           p_value_col, 
+                           log2fc_cutoff, 
+                           contrast_design, 
+                           primary_column_order, 
+                           display_top_genes):
     """Aggregates and filters significant genes from all contrasts."""
     all_sig_genes = []
     for condition, res_df in res_dict.items():
         # Get top up-regulated genes
         sigs_up = res_df[res_df[p_value_col] < p_value_cutoff].copy()
-        sigs_up = sigs_up.sort_values('stat', ascending=False).head(display_top_genes)
         sigs_up = sigs_up[sigs_up["log2FoldChange"]>=log2fc_cutoff]
+        sigs_up = sigs_up.sort_values('stat', ascending=False).head(display_top_genes)
         sigs_up[contrast_design] = condition
         all_sig_genes.append(sigs_up)
 
         # Get top down-regulated genes
         sigs_down = res_df[res_df[p_value_col] < p_value_cutoff].copy()
+        sigs_down = sigs_down[sigs_down["log2FoldChange"]<=-log2fc_cutoff]
         sigs_down = sigs_down.sort_values('stat', ascending=True).head(display_top_genes)
-        sigs_down = sigs_down[sigs_down["log2FoldChange"]<=log2fc_cutoff]
         sigs_down[contrast_design] = condition
         all_sig_genes.append(sigs_down)
 
@@ -159,18 +166,17 @@ def generate_volcano_data(
             specified contrast.
     """
     # --- Step 1: Filter metadata and set up file paths ---
-    metadata_filtered = metadata[metadata[contrast_design].isin(conditions)].copy()
-    metadata_filtered.index = metadata_filtered["sample"]
-    metadata_filtered["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for i, row in metadata_filtered.iterrows()]
+    metadata.index = metadata["sample"]
+    metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for i, row in metadata.iterrows()]
 
     # --- Step 2: Run tximport to get gene counts ---
     transcript_gene_map = create_transcript_gene_map(species="human")
     results = tximport(
-        metadata_filtered["file_path"],
+        metadata["file_path"],
         data_type="salmon",
         transcript_gene_map=transcript_gene_map,
     )
-    counts_df = pd.DataFrame(results.X, index=metadata_filtered.index, columns=results.var_names).T
+    counts_df = pd.DataFrame(results.X, index=metadata.index, columns=results.var_names).T
     counts_df.index.name = 'Geneid'
     counts_df = counts_df.loc[counts_df.sum(axis=1) > 0].T.astype(int)
 
@@ -180,10 +186,10 @@ def generate_volcano_data(
     counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
 
     # --- Step 4: Run DESeq2 analysis ---
-    inference = DefaultInference(n_cpus=8)
+    inference = DefaultInference(n_cpus=20)
     dds = DeseqDataSet(
         counts=counts_df,
-        metadata=metadata_filtered,
+        metadata=metadata,
         design=design_formula,
         refit_cooks=True,
         inference=inference,
@@ -212,14 +218,14 @@ def plot_volcano(
     contrast: list,
     highlight_genes: dict,
     palette: dict,
-    plot_name: str,
+    plot_name: str = None,
     p_value_cutoff: float = 0.05,
     log2fc_cutoff: float = 1.0,
     p_value_col: str = "padj",
     figure_size: tuple = (8, 8),
     x_range: tuple = None,
-    label_top_genes: int = 50,
-    hard_stop: bool = False,
+    label_top_genes: int = 20,
+    hard_stop: bool = True,
     font_size: int = 9,
     plot_formats: List[str] = ["png"]
 ):
@@ -255,8 +261,8 @@ def plot_volcano(
 
     plot_df['color'] = np.select(
         [
-            (plot_df[p_value_col] < p_value_cutoff) & (plot_df['log2FoldChange'] > log2fc_cutoff),
-            (plot_df[p_value_col] < p_value_cutoff) & (plot_df['log2FoldChange'] < -log2fc_cutoff)
+            (plot_df[p_value_col] < p_value_cutoff) & (plot_df['log2FoldChange'] >= log2fc_cutoff),
+            (plot_df[p_value_col] < p_value_cutoff) & (plot_df['log2FoldChange'] <= -log2fc_cutoff)
         ],
         [up_color, down_color],
         default=not_sig_color
@@ -336,18 +342,22 @@ def plot_volcano(
         plt.gca().set_ylim(top=350)
         plt.yticks([0, 50, 100, 150, 200, 250, 300, 324], labels=['0', '50', '100', '150', '200', '250', '300', '> 324'])
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    
-    for plot_format in plot_formats:
-        plt.savefig(f"figures/volcano_{plot_name}_{contrast[0]}vs{contrast[1]}.{plot_format}", dpi=300)
+
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"{save_dir}/volcano_{plot_name}_{contrast[0]}vs{contrast[1]}.{plot_format}", dpi=300)
     plt.show()
 
 def plot_expression_heatmap(
     metadata: pd.DataFrame,
-    plot_name: str,
     highlight_genes, 
     palette: Dict[str, str],
+    dds_dict: tuple = None,
     include: Optional[Dict[str, List[Any]]] = None,
     exclude: Optional[Dict[str, List[Any]]] = None,
+    plot_name: str = None,
     design_formula: str = "~Condition",
     contrast_design = "Condition", 
     ref_condition = "Untreated", 
@@ -356,8 +366,7 @@ def plot_expression_heatmap(
     log2fc_cutoff: float = 1.0,
     label_top_genes=5, 
     log_transform=False,
-    normalize_to_untreated = False,
-    do_GSEA=False,
+    normalize_to_ref = False,
     v_range=(-3, 3), 
     n_row_clusters=4,
     display_top_genes = 1000000, 
@@ -406,8 +415,6 @@ def plot_expression_heatmap(
             from each contrast to label on the heatmap. Defaults to 5.
         log_transform (bool): If True, applies a log1p transformation to the
             normalized counts before plotting. Defaults to False.
-        do_GSEA (bool): If True, enables a placeholder for Gene Set Enrichment
-            Analysis (currently not implemented). Defaults to False.
         v_range (Tuple[int, int]): The minimum and maximum values for the heatmap's
             color scale (z-score). Defaults to (-3, 3).
         n_row_clusters (int): The number of clusters to partition genes into for
@@ -436,45 +443,52 @@ def plot_expression_heatmap(
               values are their assigned cluster IDs. Returns None if clustering
               was not performed.
     """
-    # --- 1. Data Loading and Preparation ---
-    metadata["xp_cond"] = [f"{i[available_metadata_columns[0]]}_{i[available_metadata_columns[-1]]}" for _, i in metadata.iterrows()]
-    for k, v in include.items():
-        metadata = metadata[metadata[k].isin(v)]
-    for k, v in exclude.items():
-        metadata = metadata[~metadata[k].isin(v)]
-
+    
     if column_annotations is None:
         column_annotations = [available_metadata_columns[-1], available_metadata_columns[0]]
     if highlight_genes is None:
         highlight_genes = {}
-
-    metadata.index = metadata["sample"]
-    metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for _, row in metadata.iterrows()]
-
-    transcript_gene_map = create_transcript_gene_map(species="human")
-    tx_results = tximport(metadata["file_path"], data_type="salmon", transcript_gene_map=transcript_gene_map)
+        
+    if dds_dict is None:
+        print("You are not using a dds file as input. While this is possible, I highly recommend running\n dds, results = get_dds_result()\n before and adding\n dds_dict = (dds, results)\n to this function.")
+        # --- 1. Data Loading and Preparation ---
+        metadata["xp_cond"] = [f"{i[available_metadata_columns[0]]}_{i[available_metadata_columns[-1]]}" for _, i in metadata.iterrows()]
+        if include is not None:
+            for k, v in include.items():
+                metadata = metadata[metadata[k].isin(v)]
+        if exclude is not None:
+            for k, v in exclude.items():
+                metadata = metadata[~metadata[k].isin(v)]
     
-    counts_df = pd.DataFrame(tx_results.X, index=metadata.index, columns=tx_results.var_names).T
-    counts_df = counts_df[counts_df.sum(axis=1) > 0].T.astype(int)
+        metadata.index = metadata["sample"]
+        metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for _, row in metadata.iterrows()]
+        
+        transcript_gene_map = create_transcript_gene_map(species="human")
+        tx_results = tximport(metadata["file_path"], data_type="salmon", transcript_gene_map=transcript_gene_map)
+        
+        counts_df = pd.DataFrame(tx_results.X, index=metadata.index, columns=tx_results.var_names).T
+        counts_df = counts_df[counts_df.sum(axis=1) > 0].T.astype(int)
+        
+        mapper = id_map(species='human')
+        counts_df.columns = counts_df.columns.map(mapper.mapper)
+        counts_df = counts_df.loc[:, ~counts_df.columns.duplicated(keep='first')]
+        counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
     
-    mapper = id_map(species='human')
-    counts_df.columns = counts_df.columns.map(mapper.mapper)
-    counts_df = counts_df.loc[:, ~counts_df.columns.duplicated(keep='first')]
-    counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
-
-    # --- 2. DESeq2 Analysis ---
-    dds, res_dict, contrast_design = _run_deseq_analysis(
-        counts_df, metadata, design_formula, contrast_design, ref_condition
-    )
+        # --- 2. DESeq2 Analysis ---
+        dds, res_dict, contrast_design = _run_deseq_analysis(
+            counts_df, metadata, design_formula, contrast_design, ref_condition
+        )
+    else:
+        dds, res_dict = dds_dict
+        metadata = dds.obs
 
     sc.tl.pca(dds)
-    
-    for plot_format in plot_formats:
-        sc.pl.pca(dds, color = available_metadata_columns, size = 200, palette = palette, save = f'PCA_{plot_name}.{plot_format}')
 
-    # --- 3. (Optional) GSEA ---
-    if do_GSEA:
-        print("GSEA is enabled but its implementation has been omitted from this refactored function for brevity.")
+    if plot_name is not None:
+        for plot_format in plot_formats:
+            sc.pl.pca(dds, color = available_metadata_columns, size = 200, palette = palette, save = f'PCA_{plot_name}.{plot_format}')
+    else:
+        sc.pl.pca(dds, color = available_metadata_columns, size = 200, palette = palette)
 
     # --- 4. Gene Selection for Heatmap ---
     # Assuming stimulation_colors and experiment_colors are globally available
@@ -546,16 +560,20 @@ def plot_expression_heatmap(
     row_clusters["Cluster"] = row_clusters["Cluster"].astype(str)
     
     if add_left_ha_dict is not None:
-        left_ha_df = []
-        for gene in expression_df.index:
-            if gene in list(add_left_ha_dict[0].index):
-                left_ha_df.append(add_left_ha_dict[0].loc[gene]["celltype"])
-            else:
-                left_ha_df.append("other")
-        
-        left_ha_dict["Cell Type"] = pch.anno_simple(pd.Series(left_ha_df, index=expression_df.index), 
-                                                    colors=add_left_ha_dict[1],
-                                                    legend=True, add_text=False, text_kws={'fontsize':9,'color':'black'}, height = 10)
+        # new
+        for col in add_left_ha_dict[0].columns:
+            left_ha_df = []
+            for gene in expression_df.index:
+                if gene in list(add_left_ha_dict[0].index):
+                    left_ha_df.append(add_left_ha_dict[0].loc[gene][col])
+                else:
+                    left_ha_df.append("other")
+
+            left_ha_dict_color = {k:v for k,v in add_left_ha_dict[1].items() if k in set(add_left_ha_dict[0][col])}
+            left_ha_dict_color["other"] = add_left_ha_dict[1]["other"]
+            left_ha_dict[col] = pch.anno_simple(pd.Series(left_ha_df, index=expression_df.index), 
+                                                        colors= left_ha_dict_color,
+                                                        legend=True, add_text=False, text_kws={'fontsize':9,'color':'black'}, height = 10)
     
     left_ha = pch.HeatmapAnnotation(
         **left_ha_dict,
@@ -567,7 +585,7 @@ def plot_expression_heatmap(
         top_markers.extend(res.sort_values(by='stat', ascending=False).head(label_top_genes)["Symbol"].tolist())
         top_markers.extend(res.sort_values(by='stat', ascending=False).tail(label_top_genes)["Symbol"].tolist())
 
-    if normalize_to_untreated:
+    if normalize_to_ref:
         empty_df = pd.DataFrame()
         metadata["lane"] = metadata["Experiment"]
         for time in np.unique(metadata["lane"]):
@@ -620,7 +638,7 @@ def plot_expression_heatmap(
 
     # --- 5c. Plot the Heatmap ---
     plt.figure(figsize=figure_size)
-    if normalize_to_untreated:
+    if normalize_to_ref:
         cm = pch.ClusterMapPlotter(data=expression_df, #z_score=0,
                                 right_annotation=row_ha, top_annotation=col_ha,
                                 col_cluster=False,row_cluster=False,
@@ -649,16 +667,19 @@ def plot_expression_heatmap(
         )
     
     plt.suptitle(f"exp_design: {design_formula}, contrast_design: {contrast_design}, pval: {p_value_cutoff}, #genes per contrast: {label_top_genes}, used_pvalue: {p_value_col}")
-    
-    for plot_format in plot_formats:
-        plt.savefig(f"figures/cm_{plot_name}_{design_formula}_{contrast_design}.{plot_format}", bbox_inches='tight', dpi=300)
+
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"{save_dir}/cm_{plot_name}_{design_formula}_{contrast_design}.{plot_format}", bbox_inches='tight', dpi=300)
     plt.show()
 
     return expression_df, row_clusters
 
 def plot_cluster_go(
     cluster_df, 
-    plot_name,
+    plot_name: str = None,
     go_organism="hsapiens",
     go_sources=['GO:BP'], 
     figure_size=(6, 5),
@@ -724,7 +745,11 @@ def plot_cluster_go(
         gene_ratio_sizes = dict(zip(ratio_order, ratio_sizes_list))
 
         # 3. Create the plot without the automatic legend
-        go_df.to_csv(f"DEGs/goterm_{plot_name}_{cluster_no}.csv")
+        
+        save_dir = "DEGs"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        go_df.to_csv(f"{save_dir}/goterm_{plot_name}_{cluster_no}.csv")
         fig, ax = plt.subplots(figsize=figure_size)
         plot = sns.scatterplot(
             data=top_10_go,
@@ -766,19 +791,24 @@ def plot_cluster_go(
         ax.tick_params(axis='y', labelsize=12)
         
         plt.tight_layout(rect=[0, 0, 0.85, 1])
-        for plot_format in plot_formats:
-            plt.savefig(f"figures/goterm_{plot_name}_{cluster_no}.{plot_format}", dpi=300, bbox_inches='tight')
+
+        if plot_name is not None:
+            save_dir = "figures"
+            os.makedirs(save_dir, exist_ok=True)
+            for plot_format in plot_formats:
+                plt.savefig(f"{save_dir}/goterm_{plot_name}_{cluster_no}.{plot_format}", dpi=300, bbox_inches='tight')
         plt.show()
 
 def plot_gene_curves(
     metadata: pd.DataFrame, 
     expression_data: pd.DataFrame, 
-    genes_to_plot: list, 
-    plot_name: str,
-    time_col: str = 'Experiment',
+    genes_to_plot: list,
+    plot_name: str = None,
+    category_column: str = 'Experiment',
     sample_col: str = 'sample',
     condition_col: str = 'Condition',
     condition: str = None,
+    plot_order: list[str] = None,
     plot_points: bool = False, 
     figure_size: tuple = (6, 4.5),
     normalize_to_one: bool = True,
@@ -794,7 +824,7 @@ def plot_gene_curves(
                                         and columns should be sample IDs.
         genes_to_plot (list): A list of gene names (strings) to plot.
         plot_name (str): A descriptive name for the output plot file.
-        time_col (str): The name of the column in `metadata` that contains the numeric time values (e.g., hours).
+        category_column (str): The name of the column in `metadata` that contains the numeric time values (e.g., hours).
         sample_col (str): The name of the column in `metadata` that contains the unique sample IDs.
         condition_col (str): The name of the column in `metadata` that contains the condition labels.
         condition (str, optional): If specified, filters the data to only this condition. Defaults to None.
@@ -820,11 +850,14 @@ def plot_gene_curves(
     expr_df = expression_data[samples_to_plot]
 
     # Get the unique, sorted timepoints that will form the x-axis
-    try:
-        timepoints = meta_df[time_col].unique()
-    except KeyError:
-        print(f"Error: Time column '{time_col}' not found in metadata. Cannot proceed.")
-        return
+    if plot_order is None:
+        try:
+            timepoints = meta_df[category_column].unique()
+        except KeyError:
+            print(f"Error: Column '{category_column}' not found in metadata. Cannot proceed.")
+            return
+    else:
+        timepoints = plot_order
 
     # --- 2. Plotting ---
     fig, ax = plt.subplots(figsize=figure_size)
@@ -842,7 +875,7 @@ def plot_gene_curves(
         # For each timepoint, find the corresponding samples and get their expression values
         for t in timepoints:
             # Find sample IDs for the current timepoint
-            samples_at_t = meta_df[meta_df[time_col] == t][sample_col].tolist()
+            samples_at_t = meta_df[meta_df[category_column] == t][sample_col].tolist()
             
             # Get the expression values for those samples for the current gene
             values_at_t = expr_df.loc[gene, samples_at_t]
@@ -900,13 +933,16 @@ def plot_gene_curves(
     
     # Place legend outside the plot area
     ax.legend(title="Genes", bbox_to_anchor=(1.04, 1), loc='upper left')
+    ax.set_xticklabels(timepoints, rotation=40, ha="right")
     
     # Adjust layout to prevent the legend from being cut off
     plt.tight_layout(rect=[0, 0, 0.85, 1]) # Make space on the right for the legend
     
-    # Save the figure
-    for plot_format in plot_formats:
-        plt.savefig(f"figures/curve_{plot_name}.{plot_format}", dpi=300, bbox_inches='tight')
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"{save_dir}/curve_{plot_name}.{plot_format}", dpi=300, bbox_inches='tight')
         
     plt.show()
 
@@ -915,15 +951,15 @@ def plot_cluster_curve(
     metadata: pd.DataFrame,
     expression_data: pd.DataFrame,
     genes_to_plot: list,
-    plot_name: str,
     cluster: any,
-    time_col: str = "Experiment",
+    plot_name: str = None,
+    category_column: str = "Experiment",
     condition_col: str = 'Condition',
     condition: str = None,
+    plot_order: list[str] = None,
     plot_points: bool = False,
     figure_size: tuple = (7, 5),
-    save_plot: bool = True,
-    plot_formats: List[str]=["png"]
+    plot_formats: List[str]=["png"],
 ):
     """
     Plots gene expression over time, handling variable numbers of replicates per timepoint.
@@ -945,14 +981,17 @@ def plot_cluster_curve(
         metadata = metadata[metadata[condition_col]==condition]
     
     # Get the unique, sorted experiment names (e.g., ['D48', 'D58', ...])
-    experiments = metadata[time_col].unique()
+    if plot_order is None:
+        experiments = metadata[category_column].unique()
+    else:
+        experiments = plot_order
     
     # Convert experiment names to numeric x-values (e.g., 'D48' -> 48)
     # This assumes a 'D' prefix, adjust if your naming is different.
     try:
         x_values = [int(exp[1:]) for exp in experiments]
     except (ValueError, IndexError):
-        print(f"Warning: Could not parse numeric values from {time_col} column. Using simple integer sequence for x-axis.")
+        print(f"Warning: Could not parse numeric values from {category_column} column. Using simple integer sequence for x-axis.")
         x_values = experiments
 
     # --- 2. Create Plot ---
@@ -971,7 +1010,7 @@ def plot_cluster_curve(
         # Group samples by experiment to handle variable replicate numbers
         for exp in experiments:
             # Find all sample names for the current experiment
-            replicate_samples = metadata[metadata[time_col] == exp]['sample'].tolist()
+            replicate_samples = metadata[metadata[category_column] == exp]['sample'].tolist()
             
             # Get the expression values for these replicates
             values = gene_row[replicate_samples]
@@ -1008,9 +1047,10 @@ def plot_cluster_curve(
     plt.xlabel("Time") # Changed from hours to match 'D48' etc.
     plt.ylabel("Expression (Normalized, Mean ± SEM)")
     plt.title(f"Gene Expression Over Time in Cluster {cluster}")
+    plt.xticks(experiments, rotation=45, ha='right')
     plt.tight_layout()
     
-    if save_plot:
+    if plot_name is not None:
         save_dir = "figures/cluster_curves"
         os.makedirs(save_dir, exist_ok=True)
         for plot_format in plot_formats:
@@ -1019,3 +1059,523 @@ def plot_cluster_curve(
         print(f"Plot saved to {filename}")
         
     plt.show()
+
+def get_dds_results(
+    metadata,
+    include: Optional[Dict[str, List[Any]]] = None,
+    exclude: Optional[Dict[str, List[Any]]] = None, 
+    design_variable="~Condition",
+    contrast_design = "Condition", 
+    ref_condition = "Untreated",
+    data_base_path = ".."
+):
+    # --- 1. Data Loading and Preparation ---
+    metadata["xp_cond"] = [f"{i['Experiment']}_{i['Condition']}" for _, i in metadata.iterrows()]
+    if include is not None:
+        for k, v in include.items():
+            metadata = metadata[metadata[k].isin(v)]
+    if exclude is not None:
+        for k, v in exclude.items():
+            metadata = metadata[~metadata[k].isin(v)]
+
+    metadata.index = metadata["sample"]
+    metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for _, row in metadata.iterrows()]
+
+    transcript_gene_map = create_transcript_gene_map(species="human")
+    tx_results = tximport(metadata["file_path"], data_type="salmon", transcript_gene_map=transcript_gene_map)
+    
+    counts_df = pd.DataFrame(tx_results.X, index=metadata.index, columns=tx_results.var_names).T
+    counts_df = counts_df[counts_df.sum(axis=1) > 0].T.astype(int)
+    
+    mapper = id_map(species='human')
+    counts_df.columns = counts_df.columns.map(mapper.mapper)
+    counts_df = counts_df.loc[:, ~counts_df.columns.duplicated(keep='first')]
+    counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
+
+    # --- 2. DESeq2 Analysis ---
+    dds, res_dict, contrast_design = _run_deseq_analysis(
+        counts_df, metadata, design_variable, contrast_design, ref_condition
+    )
+    
+    return dds, res_dict
+
+def plot_venns(
+    plot_dict,
+    palette,
+    compare_response,
+    plot_name: str = None,
+    p_value_cutoff = 0.01,
+    p_value_col = "padj",
+    log2fc_cutoff = (-1,1),
+    plot_formats = ["png"]):
+
+    significant_genes_down = {}
+    for key, df in plot_dict.items():
+        filtered_df = df[(df[p_value_col] < p_value_cutoff) & (df['log2FoldChange'] < log2fc_cutoff[0])]
+        significant_genes_down[key] = set(filtered_df.index)
+    
+    petal_labels = generate_petal_labels(significant_genes_down.values(), fmt="{size}")
+    condition_colors_ordered = {key: palette[key] for key in significant_genes_down if key in palette}
+    hex_colors = list(condition_colors_ordered.values())
+    
+    # Convert to RGBA (with full opacity)
+    rgba_colors = [(r, g, b, 0.5) for r, g, b, _ in [mcolors.to_rgba(color) for color in hex_colors]]
+    
+    draw_venn(
+        petal_labels=petal_labels, dataset_labels=significant_genes_down.keys(),
+        hint_hidden=False, colors=rgba_colors,
+        figsize=(8, 8), fontsize=30, legend_loc="upper right", ax=None
+    )
+    
+    plt.title(f"Venn Diagram of Downregulated Genes in {compare_response[1]} Compared to {compare_response[0]}")
+    plt.suptitle(f"{list(significant_genes_down.keys())}: {p_value_col}: {p_value_cutoff}, log2fc {log2fc_cutoff[-1]}, downregulations", size = 7.5)
+
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f'figures/venn_{plot_name}_downregulations.{plot_format}', dpi = 300)
+    plt.show()
+
+    significant_genes_up = {}
+    for key, df in plot_dict.items():
+        filtered_df = df[(df[p_value_col] < p_value_cutoff) & (df['log2FoldChange'] > log2fc_cutoff[1])]
+        significant_genes_up[key] = set(filtered_df.index)
+    
+    petal_labels = generate_petal_labels(significant_genes_up.values(), fmt="{size}")
+    condition_colors_ordered = {key: palette[key] for key in significant_genes_up if key in palette}
+    hex_colors = list(condition_colors_ordered.values())
+    
+    # Convert to RGBA (with full opacity)
+    rgba_colors = [(r, g, b, 0.5) for r, g, b, _ in [mcolors.to_rgba(color) for color in hex_colors]]
+    
+    draw_venn(
+        petal_labels=petal_labels, dataset_labels=significant_genes_up.keys(),
+        hint_hidden=False, colors=rgba_colors,
+        figsize=(8, 8), fontsize=30, legend_loc="upper right", ax=None
+    )
+    
+    plt.title(f"Venn Diagram of Upregulated Genes in {compare_response[1]} Compared to {compare_response[0]}")
+    plt.suptitle(f"{list(significant_genes_up.keys())}: {p_value_col}: {p_value_cutoff}, log2fc {log2fc_cutoff[1]}, upregulations", size = 7.5)
+
+    if plot_name is not None:
+        for plot_format in plot_formats:
+            plt.savefig(f'figures/venn_{plot_name}_upregulations.{plot_format}', dpi = 300)
+    plt.show()
+
+    return significant_genes_down, significant_genes_up
+
+def plot_tpm_curve(
+    dds,
+    palette,
+    highlight_genes,
+    plot_name: str = None,
+    conditions = None,
+    condition_col = "Condition",
+    plot_formats = ["png"],
+    fig_size = (10,5)
+):
+    if conditions is None:
+        conditions = list(set(dds.obs[condition_col]))
+        
+    # Create a figure with 1 row, 2 columns of subplots.
+    # sharey=True links the y-axes for direct comparison.
+    fig, axes = plt.subplots(1, len(conditions), figsize=(fig_size[0], fig_size[1]), sharey=True)
+    if len(conditions) == 1:
+        axes = [axes]
+    
+    # --- 2. Loop through conditions and plot on each axis ---
+    for ax, condition in zip(axes, conditions):
+        # --- Data Preparation for the current condition ---
+        dds_bam = dds[dds.obs[condition_col] == condition]
+        tpm_df = pd.DataFrame(dds_bam.X, index = dds_bam.obs[condition_col], columns=dds_bam.var_names)
+        x = tpm_df.mean(axis=0).sort_values(ascending=True)
+        x = x[x > 10]
+    
+        # --- Plotting on the current axis 'ax' ---
+        ax.plot(list(range(0, len(x))), x, linestyle='-', markersize=4, label='Data Series', color=palette[condition])
+        ax.set_yscale("log")
+    
+        # --- Highlight points and add labels ---
+        points_to_highlight = []
+        for k,vs in highlight_genes.items():
+            for v in vs:
+                if v in x.index:
+                    points_to_highlight.append((v, k))
+                
+        texts = []
+    
+        for label, color in points_to_highlight:
+            x_pos = x.index.get_loc(label)
+            y_val = x.loc[label]
+            ax.scatter(x_pos, y_val, color='red', s=0, zorder=5) # s=0 makes marker invisible
+            texts.append(ax.text(x_pos, y_val, label, color=color,
+                                   ha='center', zorder=10,
+                                   bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2', edgecolor='none')))
+    
+        # --- Adjust text specifically for the current axis 'ax' ---
+        adjust_text(texts, ax=ax, # Pass the current axis to the function
+                    expand_points=(1.5, 1.5),
+                    force_static=(1.5,1.5),
+                    force_explode=(2,2),
+                    arrowprops=dict(arrowstyle="->", color='black', lw=0.5))
+    
+        # --- Final styling for the current axis 'ax' ---
+        ax.set_title(f'Normalized Expression Values for "{condition}"')
+        ax.set_xlabel("Gene Rank")
+    
+    # --- 3. Final global figure styling ---
+    axes[0].set_ylabel("Normalized Expression (log scale)") # Set Y-label only for the left plot
+    fig.suptitle(f"Comparison of Normalized Expression Values by {condition_col}", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to make room for suptitle
+
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"figures/TPMcurve_{plot_name}.{plot_format}", dpi = 300)
+        
+    plt.show()
+
+def plot_tpm_curve_comparison(
+    dds,
+    conditions,
+    highlight_genes,
+    palette,
+    plot_name = None,
+    condition_col="Condition",
+    plot_formats=["png"],
+    fig_size = (10, 5)
+):
+    # --- 1. Prepare data for BOTH conditions ---
+    dds_1 = dds[dds.obs[condition_col] == conditions[0]]
+    tpm_df_1 = pd.DataFrame(dds_1.X, index=dds_1.obs[condition_col], columns=dds_1.var_names)
+    x_1 = tpm_df_1.mean(axis=0).sort_values(ascending=True)
+    x_1 = x_1[x_1 > 10] # Base series for plotting
+    
+    # --- 2. Plotting ---
+    plt.figure(figsize=fig_size)
+    
+    # Plot the original "- TGFB1" data series
+    plt.plot(list(range(0, len(x_1))), x_1, linestyle='-', markersize=4, label=f'Normalized Expression ({conditions[0]})', color=palette[conditions[0]])
+    plt.yscale("log")
+    
+    texts = []
+    ts = []
+    
+    # --- 3. Highlight points and add vertical lines ---
+    for condition in conditions[1:]:
+        dds_2 = dds[dds.obs[condition_col] == condition]
+        tpm_df_2 = pd.DataFrame(dds_2.X, index=dds_2.obs[condition_col], columns=dds_2.var_names)
+        x_2 = tpm_df_2.mean(axis=0)
+        x_2 = x_2[x_2 > 10]
+        
+        points_to_highlight = []
+        for k,vs in highlight_genes.items():
+            for v in vs:
+                if v in x_2.index:
+                    points_to_highlight.append((v, k))
+            
+        
+        for label, col in points_to_highlight:
+            if label in x_1 and label in x_2:
+                # Get coordinates for both conditions
+                x_pos = x_1.index.get_loc(label)
+                y_val_minus = x_1.loc[label]
+                y_val_plus = x_2.loc[label]
+        
+                # Add the marker for the original point (-TGFB1)
+                plt.scatter(x_pos, y_val_minus, color=palette[conditions[0]], s=1, zorder=5)
+        
+                # Draw the vertical line connecting the two conditions
+                plt.plot([x_pos, x_pos], [y_val_minus, y_val_plus], color='gray', linestyle='--', linewidth=1.5, zorder=4)
+    
+                color = palette[condition]
+                plt.scatter(x_pos, y_val_plus, color=color, s=50, zorder=5)
+                
+                if label not in ts:
+                    ts.append(label)
+                    texts.append(plt.text(x_pos, y_val_plus, label, fontsize=10, ha='center', zorder=10, color = col,
+                                          bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2', edgecolor='none')))
+
+    # Call adjust_text to automatically position labels without overlap
+    adjust_text(texts, 
+                expand_points=(2, 2),
+                expand_text=(1.6, 1.6),
+                force_explode=(2,2),
+                arrowprops=dict(arrowstyle='->', color='black'))
+    
+    # --- 4. Final plot styling ---
+    plt.suptitle(f"{len(points_to_highlight)} genes labeled that have abs(log2fc) > 2.5 and are similar regulated in human and mouse")
+    plt.title(f"Normalized Expression Change {conditions[0]} and {conditions[1]}")
+    plt.xlabel("Gene Rank")
+    plt.ylabel("Normalized Expression (log scale)")
+    
+    # Update the legend to match the new colors
+    from matplotlib.lines import Line2D
+    legend_elements = [Line2D([0], [0], color=palette[conditions[0]], lw=2, label=f'Normalized Expression ({conditions[0]})')]
+    for condition in conditions[1:]:
+        legend_elements.append(Line2D([0], [0], marker='o', color='w', markerfacecolor=palette[condition], markersize=8, label=f'Up-/Downregulated in {condition}'))
+        
+    plt.legend(handles=legend_elements, loc='best')
+
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"figures/TPMcurvecomparison_{plot_name}.{plot_format}", dpi = 300)
+            
+    plt.show()
+
+def plot_tpm_bar(
+    dds,
+    conditions,
+    genes,
+    palette,
+    plot_points: bool = False,
+    condition_col: str = "Condition",
+    normalize_to_first: bool = True,
+    plot_name = None,
+    plot_formats: list[str]=["png"]
+):
+    # --- Data Preparation ---
+    expression_df = pd.DataFrame(dds.X.T, columns=dds.obs["sample"], index=dds.var_names)
+    
+    df_data = {}
+    for i in conditions:
+        samples = dds.obs[dds.obs[condition_col]==i]["sample"]
+        df_data[f"{i}"] = expression_df.loc[genes, samples].mean(axis=1)
+        df_data[f"{i}_sem"] = expression_df.loc[genes, samples].sem(axis=1)
+        
+    df = pd.DataFrame(df_data)
+
+    # --- Normalization (with bug fix for SEM) ---
+    if normalize_to_first:
+        # Store normalization factors (mean of the first condition)
+        norm_factors = df[conditions[0]].copy()
+        
+        # Normalize all columns (both means and SEMs) by these factors
+        for col in df.columns:
+            df[col] = df[col].div(norm_factors, axis=0)
+
+    # --- Plotting Setup ---
+    x = np.arange(len(df.index))  # The label locations
+    num_conditions = len(conditions)
+    total_width = 0.8  # The total width for a group of bars
+    bar_width = total_width / num_conditions # The width of a single bar
+    
+    fig, ax = plt.subplots(figsize=(7, 4))
+    
+    # --- Plotting Loop ---
+    for i, condition in enumerate(conditions):
+        # Calculate the offset to center the bars
+        offset = (i - (num_conditions - 1) / 2) * bar_width
+        
+        # Plot the bars
+        ax.bar(
+            x + offset, 
+            df[condition], 
+            bar_width, 
+            label=condition,
+            color=palette[condition], 
+            yerr=df[f"{condition}_sem"], 
+            capsize=4
+        )
+        
+        # --- NEW: Plot individual data points ---
+        if plot_points:
+            # 1. Get sample names for the current condition
+            samples = dds.obs[dds.obs[condition_col] == condition]["sample"]
+            
+            # 2. Get the raw expression data for these samples
+            points_data = expression_df.loc[genes, samples]
+            
+            # 3. Normalize the points if required
+            if normalize_to_first:
+                plot_points_data = points_data.div(norm_factors, axis=0)
+            else:
+                plot_points_data = points_data
+            
+            # 4. Add jitter for better visualization
+            # Create an x-position for each data point, matching the bar's position
+            x_points = np.repeat(x + offset, len(samples))
+            # Add a small amount of random noise to the x-positions
+            jitter = np.random.normal(0, bar_width * 0.1, size=len(x_points))
+            
+            # 5. Plot the points
+            ax.scatter(
+                x_points + jitter, 
+                plot_points_data.values.ravel(), 
+                s=15,           # size of the points
+                color='0.3',    # dark gray color
+                zorder=2,       # ensure points are on top of bars
+                alpha=0.7       # slight transparency
+            )
+
+    # --- Final Plot Adjustments ---
+    if normalize_to_first:
+        ax.set_ylabel(f'TPM normalized to {conditions[0]}')
+        ax.set_title('Normalized TPM')
+    else:
+        ax.set_ylabel('TPM')
+        ax.set_title('TPM')
+        
+    ax.set_xticks(x)
+    ax.set_xticklabels(df.index, rotation=45, ha='right')
+    ax.legend()
+    fig.tight_layout()
+
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"figures/TPM_{plot_name}.{plot_format}", bbox_inches='tight', dpi=300)
+    plt.show()
+
+    
+##### TODO #####
+def plot_data_correlation(
+    sc_degs,
+    bulk_degs, 
+    plot_name
+):
+    
+    sc_df = sc_degs.rename(columns={
+        'logFC.y': 'log2fc_sc',
+        'padj.y': 'padj_sc',
+        'Gene.y': 'names'
+    })[['names', 'log2fc_sc', 'padj_sc']]
+    
+    bulk_df = bulk_degs.rename(columns={
+        'Symbol': 'names',
+        'log2FoldChange': 'log2fc_bulk',
+        'padj': 'padj_bulk'
+    })[['names', 'log2fc_bulk', 'padj_bulk']]
+    
+    # Perform an outer merge to keep all genes from both datasets
+    merged_df = pd.merge(sc_df, bulk_df, on='names', how='outer')
+    
+    
+    # --- 2. Identify Significant DEGs ---
+    
+    sc_cutoff = 0.05
+    bulk_cutoff = 0.05
+    
+    # Upregulated genes (log2fc > 1 and significant)
+    up_sc = set(merged_df.loc[(merged_df['padj_sc'] < sc_cutoff) & (merged_df['log2fc_sc'] > 0.5), 'names'])
+    up_bulk = set(merged_df.loc[(merged_df['padj_bulk'] < bulk_cutoff) & (merged_df['log2fc_bulk'] > 0.5), 'names'])
+    
+    # Downregulated genes (log2fc < -1 and significant)
+    down_sc = set(merged_df.loc[(merged_df['padj_sc'] < sc_cutoff) & (merged_df['log2fc_sc'] < -0.5), 'names'])
+    down_bulk = set(merged_df.loc[(merged_df['padj_bulk'] < bulk_cutoff) & (merged_df['log2fc_bulk'] < -0.5), 'names'])
+    
+    
+    # --- 3. Generate Venn Diagrams with custom colors ---
+    
+    # Prepare data in the required dictionary format
+    upregulated_dict = {"in vivo": up_sc, "in vitro": up_bulk}
+    downregulated_dict = {"in vivo": down_sc, "in vitro": down_bulk}
+    
+    # Define custom colors as RGBA tuples (Red, Green, Blue, Alpha)
+    # The order matches the dictionary keys: blue for scRNA-seq, green for Bulk RNA-seq
+    custom_colors = [
+        (0, 0, 1, 0.5),  # Blue for scRNA-seq with 50% opacity
+        (0, 0.5, 0, 0.5) # Green for Bulk RNA-seq with 50% opacity
+    ]
+    
+    # Create a figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    
+    # --- Upregulated Venn Diagram ---
+    petal_labels_up = generate_petal_labels(upregulated_dict.values(), fmt="{size}")
+    draw_venn(
+        petal_labels=petal_labels_up,
+        dataset_labels=upregulated_dict.keys(),
+        hint_hidden=False,
+        colors=custom_colors,  # Use the custom colors
+        figsize=(3, 3),
+        fontsize=40,
+        legend_loc="best",
+        ax=ax1
+    )
+    ax1.set_title("Commonly Upregulated Genes", fontsize=16)
+    
+    # --- Downregulated Venn Diagram ---
+    petal_labels_down = generate_petal_labels(downregulated_dict.values(), fmt="{size}")
+    draw_venn(
+        petal_labels=petal_labels_down,
+        dataset_labels=downregulated_dict.keys(),
+        hint_hidden=False,
+        colors=custom_colors,  # Use the custom colors
+        figsize=(3, 3),
+        fontsize=40,
+        legend_loc="best",
+        ax=ax2
+    )
+    ax2.set_title("Commonly Downregulated Genes", fontsize=16)
+    plt.tight_layout()
+    plt.savefig(f"figures/venn_{plot_name}.png")
+    plt.savefig(f"figures/venn_{plot_name}.svg")
+    plt.show()
+
+    merged_df.to_csv(f"DEGs/{plot_name}_venn.csv") 
+    print(merged_df)
+    
+    # --- 4. Scatter Plot of Log-Fold Changes ---
+    
+    # Categorize genes for coloring
+    conditions = [
+        (merged_df['padj_sc'] < sc_cutoff) & (merged_df['padj_bulk'] < bulk_cutoff),
+        (merged_df['padj_sc'] < sc_cutoff),
+        (merged_df['padj_bulk'] < bulk_cutoff)
+    ]
+    choices = ['Significant in Both', 'Significant in scRNA-seq', 'Significant in Bulk RNA-seq']
+    merged_df['Significance'] = np.select(conditions, choices, default='Not Significant')
+    merged_df['combined_fcs'] = abs(merged_df["log2fc_sc"])+abs(merged_df["log2fc_bulk"])
+    merged_df = merged_df.dropna()
+    
+    slope, intercept, r_value, p_value, std_err = stats.linregress(merged_df["log2fc_bulk"], merged_df["log2fc_sc"])
+    r_squared = r_value**2
+    
+    top_genes = merged_df[merged_df["Significance"] == 'Significant in Both'].sort_values("combined_fcs", key=abs, ascending=False).head(40)
+    
+    # Create the plot
+    plt.figure(figsize=(7, 5))
+    sns.scatterplot(
+        data=merged_df,
+        x='log2fc_bulk',
+        y='log2fc_sc',
+        hue='Significance',
+        hue_order=['Significant in Both', 'Significant in scRNA-seq', 'Significant in Bulk RNA-seq', 'Not Significant'],
+        palette={'Significant in Both': '#1f1f1f', 'Significant in scRNA-seq': 'blue', 'Significant in Bulk RNA-seq': 'green', 'Not Significant': 'lightgray'},
+        alpha=0.7,
+        s=50,
+        edgecolor='black',
+        linewidth=0.5,
+        zorder = 5, legend=False
+    )
+    
+    # plt.xlim(-6,6)
+    # plt.ylim(-6,6)
+    
+    texts = []
+    for i, row in top_genes.iterrows():
+        texts.append(plt.text(row['log2fc_bulk'], row['log2fc_sc'], row['names'], fontsize=12, ha='center', zorder=10, 
+                              bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2', edgecolor='none')))
+    
+    # Use adjust_text to prevent labels from overlapping
+    adjust_text(texts, arrowprops=dict(arrowstyle='-', color='black', lw=0.5))
+    
+    # Add lines for reference
+    plt.plot(merged_df["log2fc_bulk"], intercept + slope*merged_df["log2fc_bulk"], 'r', label='Fitted line')
+    plt.axhline(0, color='gray', linestyle='--', zorder=0)
+    plt.axvline(0, color='gray', linestyle='--', zorder=1)
+    plt.text(0.05, 0.95, f'$R^2 = {r_squared:.4f}$\n y = {intercept:.2f} + x * {slope:.2f}', transform=plt.gca().transAxes, fontsize=12,
+         verticalalignment='top')
+
+    plt.xlabel('in vitro iMGLs - TGFB1 vs. + TGFB1 (log2FC)', fontsize=12)
+    plt.ylabel('in vivo xBAM vs. xMGLs (log2FC)', fontsize=12)
+    plt.savefig(f"figures/correlation_{plot_name}.png")
+    plt.savefig(f"figures/correlation_{plot_name}.svg")
+    plt.show()
+    return merged_df, (upregulated_dict, downregulated_dict)
