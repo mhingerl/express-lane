@@ -1812,7 +1812,9 @@ def show_off(
     highlight_genes: dict,
     palette: dict = None,
     conditions: list = None,
-    available_metadata_columns: list = ["Condition", "Experiment"]
+    available_metadata_columns: list = ["Condition"],
+    plot_name:str = None,
+    plot_formats: list = []
     
 ):
     if conditions is None:
@@ -1822,6 +1824,9 @@ def show_off(
             conditions = list(set(metadata[available_metadata_columns[0]]))
     if palette is None:
         palette = _get_color_palette(conditions)
+        if len(available_metadata_columns) > 1:
+            for exp in set(metadata[available_metadata_columns[1]]):
+                palette[exp] = list(_get_color_palette(exp).values())[0]
     
     dds, results = get_dds_results(
         metadata = metadata,
@@ -1833,47 +1838,88 @@ def show_off(
         conditions = conditions,
         genes = list(highlight_genes.values())[0],
         palette = palette,
-        plot_points = True
+        plot_points = True,
+        plot_name = plot_name,
+        plot_formats = plot_formats
     )
-
+    
     expression_df, row_clusters = plot_expression_heatmap(
         metadata = metadata,
         dds_dict = (dds, results),
         highlight_genes=highlight_genes,
         palette = palette,
-        available_metadata_columns = [available_metadata_columns[0]],
+        available_metadata_columns = available_metadata_columns,
         ref_condition=conditions[0],
-        n_row_clusters=2
+        n_row_clusters=2,
+        plot_name = plot_name,
+        plot_formats = plot_formats
     )
     
     plot_go(
-        row_clusters
+        row_clusters,
+        plot_name = plot_name,
+        plot_formats = plot_formats
     )
+
+    plot_gene_curves(
+        metadata = metadata,
+        expression_data = expression_df,
+        genes_to_plot = list(highlight_genes.values())[0],
+        category_column = available_metadata_columns[0],
+        plot_order = metadata[available_metadata_columns[0]].cat.categories,
+        plot_name = plot_name,
+        plot_formats = plot_formats
+    )
+
+    for cluster in set(row_clusters["Cluster"]):
+        cluster_genes = list(row_clusters[row_clusters["Cluster"]==cluster].index)
+        if len(cluster_genes) > 0:
+            print(len(cluster_genes))
+            plot_cluster_curve(
+                metadata=metadata, 
+                expression_data = expression_df, 
+                genes_to_plot = cluster_genes, 
+                cluster = cluster,
+                category_column = available_metadata_columns[0],
+                plot_order = metadata[available_metadata_columns[0]].cat.categories,
+                plot_name = plot_name,
+                plot_formats = plot_formats
+            )
 
     plot_tpm_curve(
         dds = dds,
         palette = palette,
         highlight_genes = highlight_genes,
-        conditions = conditions
+        conditions = conditions,
+        plot_name = plot_name,
+        plot_formats = plot_formats
     )
+    
     plot_tpm_curve_comparison(
         dds = dds,
         conditions = conditions,
         highlight_genes = highlight_genes,
-        palette = palette
+        palette = palette,
+        plot_name = plot_name,
+        plot_formats = plot_formats
     )
 
-    plot_volcano(
-        deseq_results = results[conditions[1]],
-        contrast = [conditions[0], conditions[1]],
-        highlight_genes=highlight_genes,
-        palette=palette
-    )
-
-    plot_go_enrichment(
-        deseq_results = results[conditions[1]],
-        contrast = [conditions[0], conditions[1]],
-        palette = palette
-    )
+    for cond in conditions[1:]:
+        plot_volcano(
+            deseq_results = results[cond],
+            contrast = [conditions[0], cond],
+            highlight_genes=highlight_genes,
+            palette=palette,
+            plot_name = plot_name,
+            plot_formats = plot_formats
+        )
+    
+        plot_go_enrichment(
+            deseq_results = results[cond],
+            contrast = [conditions[0], cond],
+            palette = palette,
+            plot_name = plot_name,
+            plot_formats = plot_formats
+        )
 
     return dds, results, palette
