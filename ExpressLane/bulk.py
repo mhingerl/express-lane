@@ -8,21 +8,25 @@ import scanpy as sc
 import os
 
 # Import libraries for analysis
+from adjustText import adjust_text
+from gprofiler import GProfiler
+from itertools import chain, combinations
+import matplotlib.colors as mcolors
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.lines import Line2D
 from pytximport import tximport
 from pytximport.utils import create_transcript_gene_map
-from sanbomics.tools import id_map
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.default_inference import DefaultInference
 from pydeseq2.ds import DeseqStats
+import random
+from sanbomics.tools import id_map
 from scipy.cluster.hierarchy import linkage, cut_tree, leaves_list
 from scipy.spatial.distance import pdist
 from scipy.stats import zscore
-from typing import Dict, List, Tuple, Optional, Any
-from adjustText import adjust_text
-from gprofiler import GProfiler
-import matplotlib.colors as mcolors
 from scipy.stats import sem
-from matplotlib.colors import LinearSegmentedColormap
+from scipy import stats
+from typing import Dict, List, Tuple, Optional, Any
 from venn import generate_petal_labels, draw_venn, generate_colors
 
 def custom_slicer(df, initial_rows=50, block_size=50, step = 3):
@@ -66,6 +70,31 @@ def wrap_text_by_words(text, words_per_line=2):
             # Join the first part, add a newline, then join the rest
             return ' '.join(words[:words_per_line]) + '\n' + ' '.join(words[words_per_line:])
         return text
+
+def _get_color_palette(keys: List[str]) -> Dict[str, str]:
+    """Generates a dictionary of random hex colors for a given list of keys.
+
+    This function is useful for creating color mappings for plotting when a
+    pre-defined palette is not available.
+
+    Args:
+        keys (List[str]): A list of strings that will be used as keys
+                          in the output dictionary (e.g., condition names).
+
+    Returns:
+        Dict[str, str]: A dictionary where each key from the input list
+                        maps to a randomly generated hex color code (e.g., '#a4c2f4').
+    """
+    palette = {}
+    for key in keys:
+        color = f'#{random.randint(0, 0xFFFFFF):06x}'
+        
+        while color in palette.values():
+            color = f'#{random.randint(0, 0xFFFFFF):06x}'
+            
+        palette[key] = color
+        
+    return palette
 
 def _run_deseq_analysis(counts_df, metadata, design_formula, contrast_design, ref_condition):
     """Sets up and runs the full DESeq2 analysis pipeline."""
@@ -141,7 +170,8 @@ def generate_volcano_data(
     conditions: list,
     design_formula: str = "~Condition",
     contrast_design = "Condition",
-    data_base_path: str = ".."
+    data_base_path: str = "..",
+    transcriptome_species = "human"
 ) -> pd.DataFrame:
     """Filters metadata for a specific contrast, runs DESeq2, and returns the results.
 
@@ -170,7 +200,7 @@ def generate_volcano_data(
     metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for i, row in metadata.iterrows()]
 
     # --- Step 2: Run tximport to get gene counts ---
-    transcript_gene_map = create_transcript_gene_map(species="human")
+    transcript_gene_map = create_transcript_gene_map(species=transcriptome_species)
     results = tximport(
         metadata["file_path"],
         data_type="salmon",
@@ -181,7 +211,7 @@ def generate_volcano_data(
     counts_df = counts_df.loc[counts_df.sum(axis=1) > 0].T.astype(int)
 
     # --- Step 3: Map Ensembl IDs to Gene Symbols ---
-    mapper = id_map(species='human')
+    mapper = id_map(species=transcriptome_species)
     counts_df.columns = counts_df.columns.map(mapper.mapper)
     counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
 
@@ -368,7 +398,7 @@ def plot_expression_heatmap(
     log_transform=False,
     normalize_to_ref = False,
     v_range=(-3, 3), 
-    n_row_clusters=4,
+    n_row_clusters=None,
     display_top_genes = 1000000, 
     add_left_ha_dict = None, 
     figure_size=(8, 14), 
@@ -376,7 +406,8 @@ def plot_expression_heatmap(
     plot_formats: List[str] = ["png"],
     available_metadata_columns: List[str] = ["Condition", "Experiment"],
     data_base_path: str = "..",
-    gois_only = False
+    gois_only = False,
+    transcriptome_species = "human"
 ):
     """Performs a complete bulk RNA-seq analysis and generates a clustered heatmap.
     
@@ -463,13 +494,13 @@ def plot_expression_heatmap(
         metadata.index = metadata["sample"]
         metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for _, row in metadata.iterrows()]
         
-        transcript_gene_map = create_transcript_gene_map(species="human")
+        transcript_gene_map = create_transcript_gene_map(species=transcriptome_species)
         tx_results = tximport(metadata["file_path"], data_type="salmon", transcript_gene_map=transcript_gene_map)
         
         counts_df = pd.DataFrame(tx_results.X, index=metadata.index, columns=tx_results.var_names).T
         counts_df = counts_df[counts_df.sum(axis=1) > 0].T.astype(int)
         
-        mapper = id_map(species='human')
+        mapper = id_map(species=transcriptome_species)
         counts_df.columns = counts_df.columns.map(mapper.mapper)
         counts_df = counts_df.loc[:, ~counts_df.columns.duplicated(keep='first')]
         counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
@@ -537,27 +568,29 @@ def plot_expression_heatmap(
     metadata = metadata.sort_values(column_annotations)
     expression_df = expression_df[metadata.index]
 
-    # --- 5a. Hierarchical Clustering and Row Reordering (Z-Score Corrected) ---
-    scaled_expression_df = expression_df.T.apply(zscore).T.fillna(0)
+    left_ha_dict = {}
 
-    row_linkage = linkage(pdist(scaled_expression_df, metric='euclidean'), method='ward')
-    row_clusters = cut_tree(row_linkage, n_clusters=n_row_clusters).flatten()
+    if n_row_clusters is not None:
+        # --- 5a. Hierarchical Clustering and Row Reordering (Z-Score Corrected) ---
+        scaled_expression_df = expression_df.T.apply(zscore).T.fillna(0)
     
-    ordered_row_indices = leaves_list(row_linkage)
-    ordered_gene_names = expression_df.index[ordered_row_indices]
+        row_linkage = linkage(pdist(scaled_expression_df, metric='euclidean'), method='ward')
+        row_clusters = cut_tree(row_linkage, n_clusters=n_row_clusters).flatten()
+        
+        ordered_row_indices = leaves_list(row_linkage)
+        ordered_gene_names = expression_df.index[ordered_row_indices]
+        
+        expression_df = expression_df.loc[ordered_gene_names]
+        row_clusters = pd.Series(row_clusters[ordered_row_indices], index=ordered_gene_names)
     
-    expression_df = expression_df.loc[ordered_gene_names]
-    row_clusters = pd.Series(row_clusters[ordered_row_indices], index=ordered_gene_names)
-
-    # --- 5b. Define Annotations ---
-    cluster_palette = sns.color_palette("Set2", n_row_clusters)
-    row_clusters = pd.DataFrame(row_clusters, columns = ["Cluster"]).sort_values(by="Cluster")
-
-    left_ha_dict = {"Gene Cluster": pch.anno_simple(row_clusters["Cluster"], 
-                                                    colors=cluster_palette,
-                                                    legend=True, add_text=True, text_kws={'fontsize':9,'color':'black'})} ##
-    
-    row_clusters["Cluster"] = row_clusters["Cluster"].astype(str)
+        # --- 5b. Define Annotations ---
+        cluster_palette = sns.color_palette("Set2", n_row_clusters)
+        row_clusters = pd.DataFrame(row_clusters, columns = ["Cluster"]).sort_values(by="Cluster")
+        left_ha_dict["Gene Cluster"] = pch.anno_simple(row_clusters["Cluster"], 
+                                                        colors=cluster_palette,
+                                                        legend=True, add_text=True, text_kws={'fontsize':9,'color':'black'})
+        
+        row_clusters["Cluster"] = row_clusters["Cluster"].astype(str)
     
     if add_left_ha_dict is not None:
         # new
@@ -574,11 +607,12 @@ def plot_expression_heatmap(
             left_ha_dict[col] = pch.anno_simple(pd.Series(left_ha_df, index=expression_df.index), 
                                                         colors= left_ha_dict_color,
                                                         legend=True, add_text=False, text_kws={'fontsize':9,'color':'black'}, height = 10)
-    
-    left_ha = pch.HeatmapAnnotation(
-        **left_ha_dict,
-        axis=0, plot_legend=True, legend_side='right'
-    )
+
+    if left_ha_dict != {}:
+        left_ha = pch.HeatmapAnnotation(
+            **left_ha_dict,
+            axis=0, plot_legend=True, legend_side='right'
+        )
 
     top_markers = []
     for res in res_dict.values():
@@ -650,21 +684,37 @@ def plot_expression_heatmap(
                                 yticklabels_kws = {'labelsize':6}, vmin=v_range[0],vmax=v_range[1]
                                )
     else:
-        cm = pch.ClusterMapPlotter(
-            data=expression_df, z_score=0, 
-            left_annotation=left_ha,
-            right_annotation=row_ha,
-            top_annotation=col_ha,
-            row_cluster=False, 
-            row_dendrogram=False,
-            col_cluster=False,
-            col_dendrogram=False,
-            label='Z-score',
-            show_rownames=False,
-            show_colnames=False,
-            cmap='viridis',
-            vmin=v_range[0], vmax=v_range[1]
-        )
+        if left_ha_dict != {}:
+            cm = pch.ClusterMapPlotter(
+                data=expression_df, z_score=0, 
+                left_annotation=left_ha,
+                right_annotation=row_ha,
+                top_annotation=col_ha,
+                row_cluster=[False if n_row_clusters is not None else True], 
+                row_dendrogram=False,
+                col_cluster=False,
+                col_dendrogram=False,
+                label='Z-score',
+                show_rownames=False,
+                show_colnames=False,
+                cmap='viridis',
+                vmin=v_range[0], vmax=v_range[1]
+            )
+        else:
+            cm = pch.ClusterMapPlotter(
+                data=expression_df, z_score=0, 
+                right_annotation=row_ha,
+                top_annotation=col_ha,
+                row_cluster=[False if n_row_clusters is not None else True], 
+                row_dendrogram=False,
+                col_cluster=False,
+                col_dendrogram=False,
+                label='Z-score',
+                show_rownames=False,
+                show_colnames=False,
+                cmap='viridis',
+                vmin=v_range[0], vmax=v_range[1]
+            )
     
     plt.suptitle(f"exp_design: {design_formula}, contrast_design: {contrast_design}, pval: {p_value_cutoff}, #genes per contrast: {label_top_genes}, used_pvalue: {p_value_col}")
 
@@ -675,10 +725,13 @@ def plot_expression_heatmap(
             plt.savefig(f"{save_dir}/cm_{plot_name}_{design_formula}_{contrast_design}.{plot_format}", bbox_inches='tight', dpi=300)
     plt.show()
 
-    return expression_df, row_clusters
+    if n_row_clusters is not None:
+        return expression_df, row_clusters
+    else:
+        return expression_df, None
 
-def plot_cluster_go(
-    cluster_df, 
+def plot_go(
+    genes, 
     plot_name: str = None,
     go_organism="hsapiens",
     go_sources=['GO:BP'], 
@@ -704,7 +757,12 @@ def plot_cluster_go(
         if ratio >= 0.2: return '0.2'
         return '< 0.2'
     # ----------------------------------------------------
-
+    if type(genes) == pd.DataFrame:
+        cluster_df = genes
+    if type(genes) == list:
+        cluster_df = pd.DataFrame(index = genes)
+        cluster_df["Cluster"] = "Gene List"
+        
     for cluster_no in np.unique(cluster_df["Cluster"]):
         gene_list = list(cluster_df[cluster_df["Cluster"] == cluster_no].index)
         
@@ -1067,7 +1125,8 @@ def get_dds_results(
     design_variable="~Condition",
     contrast_design = "Condition", 
     ref_condition = "Untreated",
-    data_base_path = ".."
+    data_base_path = "..",
+    transcriptome_species="human"
 ):
     # --- 1. Data Loading and Preparation ---
     metadata["xp_cond"] = [f"{i['Experiment']}_{i['Condition']}" for _, i in metadata.iterrows()]
@@ -1081,13 +1140,13 @@ def get_dds_results(
     metadata.index = metadata["sample"]
     metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for _, row in metadata.iterrows()]
 
-    transcript_gene_map = create_transcript_gene_map(species="human")
+    transcript_gene_map = create_transcript_gene_map(species=transcriptome_species)
     tx_results = tximport(metadata["file_path"], data_type="salmon", transcript_gene_map=transcript_gene_map)
     
     counts_df = pd.DataFrame(tx_results.X, index=metadata.index, columns=tx_results.var_names).T
     counts_df = counts_df[counts_df.sum(axis=1) > 0].T.astype(int)
     
-    mapper = id_map(species='human')
+    mapper = id_map(species=transcriptome_species)
     counts_df.columns = counts_df.columns.map(mapper.mapper)
     counts_df = counts_df.loc[:, ~counts_df.columns.duplicated(keep='first')]
     counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
@@ -1104,7 +1163,7 @@ def plot_venns(
     palette,
     compare_response,
     plot_name: str = None,
-    p_value_cutoff = 0.01,
+    p_value_cutoff = 0.05,
     p_value_col = "padj",
     log2fc_cutoff = (-1,1),
     plot_formats = ["png"]):
@@ -1173,14 +1232,14 @@ def plot_tpm_curve(
     conditions = None,
     condition_col = "Condition",
     plot_formats = ["png"],
-    fig_size = (10,5)
+    figure_size = (10,5)
 ):
     if conditions is None:
         conditions = list(set(dds.obs[condition_col]))
         
     # Create a figure with 1 row, 2 columns of subplots.
     # sharey=True links the y-axes for direct comparison.
-    fig, axes = plt.subplots(1, len(conditions), figsize=(fig_size[0], fig_size[1]), sharey=True)
+    fig, axes = plt.subplots(1, len(conditions), figsize=(figure_size[0], figure_size[1]), sharey=True)
     if len(conditions) == 1:
         axes = [axes]
     
@@ -1245,7 +1304,7 @@ def plot_tpm_curve_comparison(
     plot_name = None,
     condition_col="Condition",
     plot_formats=["png"],
-    fig_size = (10, 5)
+    figure_size = (10, 5)
 ):
     # --- 1. Prepare data for BOTH conditions ---
     dds_1 = dds[dds.obs[condition_col] == conditions[0]]
@@ -1254,7 +1313,7 @@ def plot_tpm_curve_comparison(
     x_1 = x_1[x_1 > 10] # Base series for plotting
     
     # --- 2. Plotting ---
-    plt.figure(figsize=fig_size)
+    plt.figure(figsize=figure_size)
     
     # Plot the original "- TGFB1" data series
     plt.plot(list(range(0, len(x_1))), x_1, linestyle='-', markersize=4, label=f'Normalized Expression ({conditions[0]})', color=palette[conditions[0]])
@@ -1312,7 +1371,6 @@ def plot_tpm_curve_comparison(
     plt.ylabel("Normalized Expression (log scale)")
     
     # Update the legend to match the new colors
-    from matplotlib.lines import Line2D
     legend_elements = [Line2D([0], [0], color=palette[conditions[0]], lw=2, label=f'Normalized Expression ({conditions[0]})')]
     for condition in conditions[1:]:
         legend_elements.append(Line2D([0], [0], marker='o', color='w', markerfacecolor=palette[condition], markersize=8, label=f'Up-/Downregulated in {condition}'))
@@ -1340,6 +1398,8 @@ def plot_tpm_bar(
 ):
     # --- Data Preparation ---
     expression_df = pd.DataFrame(dds.X.T, columns=dds.obs["sample"], index=dds.var_names)
+
+    genes = [gene for gene in genes if gene in dds.var_names]
     
     df_data = {}
     for i in conditions:
@@ -1432,58 +1492,176 @@ def plot_tpm_bar(
             plt.savefig(f"figures/TPM_{plot_name}.{plot_format}", bbox_inches='tight', dpi=300)
     plt.show()
 
+def plot_go_enrichment(
+    deseq_results: pd.DataFrame,
+    contrast: list,
+    palette: dict,
+    p_value_cutoff = 0.05,
+    p_value_col = "padj",
+    log2fc_cutoff: tuple = (-1,1),
+    plot_name: str = None,
+    n_top_terms: int = 10,
+    lfc_range: tuple = (-1.5, 1.5),
+    figure_size: tuple = (10, 8),
+    plot_formats: list = [],
+    go_organism = "hsapiens",
+    go_sources=['GO:BP']
     
-##### TODO #####
-def plot_data_correlation(
-    sc_degs,
-    bulk_degs, 
-    plot_name
 ):
+    """
+    Generates a stacked bar plot of top enriched GO terms with a custom continuous colormap.
+
+    Args:
+        go_results (pd.DataFrame): DataFrame of results from gProfiler.
+            Must be run with no_evidences=False to include the 'intersection' column.
+        deseq_results (pd.DataFrame): DataFrame of DESeq2 results containing
+            'log2FoldChange' values, indexed by gene symbols.
+        plot_name (str): A base name for the output plot files.
+        contrast (list): A list of two strings defining the contrast,
+            e.g., ["Untreated", "Treated"]. The first is used for the negative
+            color, the second for the positive.
+        palette (dict): A dictionary mapping condition names to colors.
+        n_top_terms (int): The number of top GO terms to display. Defaults to 10.
+        lfc_range (tuple): The range of log2 fold change values for the colormap.
+            Defaults to (-1.5, 1.5).
+        figure_size (tuple): The size (width, height) of the output figure.
+        plot_formats (List[str]): List of file formats to save the plots in.
+    """
+    significant_genes = deseq_results[deseq_results[p_value_col] <= p_value_cutoff]
+    significant_genes = significant_genes[
+    (significant_genes["log2FoldChange"] >= log2fc_cutoff[1]) |
+    (significant_genes["log2FoldChange"] <= log2fc_cutoff[0])
+    ]
+    gp = GProfiler(return_dataframe=True)
+    go_results = gp.profile(
+        organism=go_organism,
+        query=list(significant_genes["Symbol"]),
+        sources=go_sources,
+        no_evidences=False
+    )
+    # --- 1. Prepare the data for plotting ---
+    top_terms = go_results.head(n_top_terms).copy()
+    top_terms['log_p_val'] = -np.log10(top_terms['p_value'])
+    top_terms = top_terms.sort_values(by='log_p_val', ascending=True)
+
+    # --- 2. Set up the custom colormap and normalization ---
+    norm = mcolors.Normalize(vmin=lfc_range[0], vmax=lfc_range[1])
     
-    sc_df = sc_degs.rename(columns={
-        'logFC.y': 'log2fc_sc',
-        'padj.y': 'padj_sc',
-        'Gene.y': 'names'
-    })[['names', 'log2fc_sc', 'padj_sc']]
+    # THE FIX 1: Dynamically get colors from the palette based on the contrast
+    color_neg = palette[contrast[0]] # e.g., "Untreated" color
+    color_pos = palette[contrast[1]] # e.g., "Treated" color
     
-    bulk_df = bulk_degs.rename(columns={
-        'Symbol': 'names',
-        'log2FoldChange': 'log2fc_bulk',
-        'padj': 'padj_bulk'
-    })[['names', 'log2fc_bulk', 'padj_bulk']]
+    custom_cmap = LinearSegmentedColormap.from_list(
+        "custom_diverging_map", [color_neg, "white", color_pos]
+    )
+
+    # --- 3. Create the plot ---
+    fig, ax = plt.subplots(figsize=figure_size)
+    y_labels = []
+    y_positions = np.arange(len(top_terms))
+
+    for i, row in enumerate(top_terms.itertuples()):
+        y_labels.append(row.name)
+        bar_length = row.log_p_val
+        
+        # RESTORED FIX: Split the intersection string to get the list of genes
+        intersecting_genes = row.intersections
+        valid_genes = [gene for gene in intersecting_genes if gene in deseq_results.index]
+        if not valid_genes:
+            continue
+            
+        gene_lfc = deseq_results.loc[valid_genes]['log2FoldChange'].sort_values()
+        
+        if len(gene_lfc) == 0: continue
+
+        segment_width = bar_length / len(gene_lfc)
+        current_pos = 0
+        
+        for lfc in gene_lfc:
+            color = custom_cmap(norm(lfc))
+            ax.barh(
+                y=i, width=segment_width, left=current_pos,
+                color=color, edgecolor='white', linewidth=0
+            )
+            current_pos += segment_width
+
+    # --- 4. Finalize and style the plot ---
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(y_labels, fontsize=12)
+    ax.set_xlabel('-log10(p-value)', fontsize=14)
+    ax.set_title('Top Enriched GO Pathways', fontsize=16)
     
-    # Perform an outer merge to keep all genes from both datasets
-    merged_df = pd.merge(sc_df, bulk_df, on='names', how='outer')
+    # THE FIX 2: Use the 'custom_cmap' for the colorbar, not an undefined variable
+    sm = plt.cm.ScalarMappable(cmap=custom_cmap, norm=norm)
+    sm.set_array([]) 
+    cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30)
+    cbar.set_label('log2 Fold Change', fontsize=12)
     
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     
-    # --- 2. Identify Significant DEGs ---
-    
-    sc_cutoff = 0.05
-    bulk_cutoff = 0.05
-    
-    # Upregulated genes (log2fc > 1 and significant)
-    up_sc = set(merged_df.loc[(merged_df['padj_sc'] < sc_cutoff) & (merged_df['log2fc_sc'] > 0.5), 'names'])
-    up_bulk = set(merged_df.loc[(merged_df['padj_bulk'] < bulk_cutoff) & (merged_df['log2fc_bulk'] > 0.5), 'names'])
+    plt.tight_layout()
+
+    if plot_name is not None:
+        for plot_format in plot_formats:
+            plt.savefig(f"figures/go_enrichment_{plot_name}.{plot_format}", dpi=300)
+    plt.show()
+
+def plot_logfc_correlation(
+    deg_dfs: list,
+    conditions: list,
+    palette: dict,
+    p_value_cutoff = (0.05, 0.05),
+    p_value_col = "padj",
+    log2fc_cutoff: tuple = ((-1,1),(-1,1)),
+    label_top_genes: int = 20,
+    plot_name: str = None,
+    plot_format: list[str] = [],
+    figure_size: tuple = (7, 5)
+):
+    for i, deg_df in enumerate(deg_dfs):
+        deg_df = deg_df.rename(
+            columns={
+                "log2FoldChange": f"log2fc_{i}",
+                "padj": f"padj_{i}"
+    })[['Symbol', f'log2fc_{i}', f'padj_{i}']]
+        deg_dfs[i] = deg_df
+        
+    merged_df = pd.merge(deg_dfs[0], deg_dfs[1], on='Symbol', how='outer')
+
+    up_0 = set(
+        merged_df.loc[
+        (merged_df['padj_0'] <= p_value_cutoff[0]) & 
+        (merged_df['log2fc_0'] >= log2fc_cutoff[0][1]), 
+        'Symbol'])
+    up_1 = set(
+        merged_df.loc[
+        (merged_df['padj_1'] <= p_value_cutoff[1]) & 
+        (merged_df['log2fc_1'] >= log2fc_cutoff[1][1]), 
+        'Symbol'])
     
     # Downregulated genes (log2fc < -1 and significant)
-    down_sc = set(merged_df.loc[(merged_df['padj_sc'] < sc_cutoff) & (merged_df['log2fc_sc'] < -0.5), 'names'])
-    down_bulk = set(merged_df.loc[(merged_df['padj_bulk'] < bulk_cutoff) & (merged_df['log2fc_bulk'] < -0.5), 'names'])
+
+    down_0 = set(
+        merged_df.loc[
+        (merged_df['padj_0'] <= p_value_cutoff[0]) & 
+        (merged_df['log2fc_0'] <= log2fc_cutoff[0][0]), 
+        'Symbol'])
+    down_1 = set(
+        merged_df.loc[
+        (merged_df['padj_1'] <= p_value_cutoff[1]) & 
+        (merged_df['log2fc_1'] <= log2fc_cutoff[1][0]), 
+        'Symbol'])
+
+    upregulated_dict = {conditions[0]: up_0, conditions[1]: up_1}
+    downregulated_dict = {conditions[0]: down_0, conditions[1]: down_1}
+
     
-    
-    # --- 3. Generate Venn Diagrams with custom colors ---
-    
-    # Prepare data in the required dictionary format
-    upregulated_dict = {"in vivo": up_sc, "in vitro": up_bulk}
-    downregulated_dict = {"in vivo": down_sc, "in vitro": down_bulk}
-    
-    # Define custom colors as RGBA tuples (Red, Green, Blue, Alpha)
-    # The order matches the dictionary keys: blue for scRNA-seq, green for Bulk RNA-seq
-    custom_colors = [
-        (0, 0, 1, 0.5),  # Blue for scRNA-seq with 50% opacity
-        (0, 0.5, 0, 0.5) # Green for Bulk RNA-seq with 50% opacity
-    ]
-    
-    # Create a figure with two subplots
+    condition_colors_ordered = {key: palette[key] for key in conditions if key in palette}
+    hex_colors = list(condition_colors_ordered.values())
+
+    rgba_colors = [(r, g, b, 0.5) for r, g, b, _ in [mcolors.to_rgba(color) for color in hex_colors]]
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
     
     # --- Upregulated Venn Diagram ---
@@ -1492,7 +1670,7 @@ def plot_data_correlation(
         petal_labels=petal_labels_up,
         dataset_labels=upregulated_dict.keys(),
         hint_hidden=False,
-        colors=custom_colors,  # Use the custom colors
+        colors=rgba_colors,  # Use the custom colors
         figsize=(3, 3),
         fontsize=40,
         legend_loc="best",
@@ -1506,7 +1684,7 @@ def plot_data_correlation(
         petal_labels=petal_labels_down,
         dataset_labels=downregulated_dict.keys(),
         hint_hidden=False,
-        colors=custom_colors,  # Use the custom colors
+        colors=rgba_colors,  # Use the custom colors
         figsize=(3, 3),
         fontsize=40,
         legend_loc="best",
@@ -1514,68 +1692,188 @@ def plot_data_correlation(
     )
     ax2.set_title("Commonly Downregulated Genes", fontsize=16)
     plt.tight_layout()
-    plt.savefig(f"figures/venn_{plot_name}.png")
-    plt.savefig(f"figures/venn_{plot_name}.svg")
+    
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"{save_dir}/venncorrelation_{plot_name}_{conditions[0]}vs{conditions[1]}.{plot_format}", dpi=300)
+        os.makedirs("DEGs", exist_ok=True)
+        merged_df.to_csv(f"DEGs/venn_{plot_name}.csv")
     plt.show()
 
-    merged_df.to_csv(f"DEGs/{plot_name}_venn.csv") 
-    print(merged_df)
-    
-    # --- 4. Scatter Plot of Log-Fold Changes ---
-    
-    # Categorize genes for coloring
-    conditions = [
-        (merged_df['padj_sc'] < sc_cutoff) & (merged_df['padj_bulk'] < bulk_cutoff),
-        (merged_df['padj_sc'] < sc_cutoff),
-        (merged_df['padj_bulk'] < bulk_cutoff)
+    ## correlation plot
+    # merged_df = merged_df[(merged_df["padj_0"] <= p_value_cutoff[0]) & (merged_df["padj_1"] <= p_value_cutoff[1])]
+    criteria = [
+        (merged_df['padj_0'] <= p_value_cutoff[0]) & (merged_df['padj_1'] <= p_value_cutoff[1]),
+        (merged_df['padj_0'] <= p_value_cutoff[0]),
+        (merged_df['padj_1'] <= p_value_cutoff[1])
     ]
-    choices = ['Significant in Both', 'Significant in scRNA-seq', 'Significant in Bulk RNA-seq']
-    merged_df['Significance'] = np.select(conditions, choices, default='Not Significant')
-    merged_df['combined_fcs'] = abs(merged_df["log2fc_sc"])+abs(merged_df["log2fc_bulk"])
+    choices = ['Significant in Both', f'Significant in {criteria[0]}', f'Significant in {criteria[1]}']
+    merged_df['Significance'] = np.select(criteria, choices, default='Not Significant')
+    
+    merged_df['combined_fcs'] = abs(merged_df["log2fc_0"])+abs(merged_df["log2fc_1"])
     merged_df = merged_df.dropna()
     
-    slope, intercept, r_value, p_value, std_err = stats.linregress(merged_df["log2fc_bulk"], merged_df["log2fc_sc"])
+    slope, intercept, r_value, p_value, std_err = stats.linregress(merged_df["log2fc_0"], merged_df["log2fc_1"])
     r_squared = r_value**2
     
-    top_genes = merged_df[merged_df["Significance"] == 'Significant in Both'].sort_values("combined_fcs", key=abs, ascending=False).head(40)
+    top_genes = merged_df.sort_values("combined_fcs", key=abs, ascending=False).head(label_top_genes)
     
     # Create the plot
-    plt.figure(figsize=(7, 5))
+    plt.figure(figsize=figure_size)
     sns.scatterplot(
         data=merged_df,
-        x='log2fc_bulk',
-        y='log2fc_sc',
+        x='log2fc_0',
+        y='log2fc_1',
         hue='Significance',
-        hue_order=['Significant in Both', 'Significant in scRNA-seq', 'Significant in Bulk RNA-seq', 'Not Significant'],
-        palette={'Significant in Both': '#1f1f1f', 'Significant in scRNA-seq': 'blue', 'Significant in Bulk RNA-seq': 'green', 'Not Significant': 'lightgray'},
+        hue_order=['Significant in Both', 
+                   f'Significant in {conditions[0]}', 
+                   f'Significant in {conditions[1]}', 
+                   'Not Significant'],
+        palette={'Significant in Both': '#1f1f1f', 
+                 f'Significant in {conditions[0]}': palette[conditions[0]], 
+                 f'Significant in {conditions[1]}': palette[conditions[1]], 
+                 'Not Significant': 'lightgray'},
         alpha=0.7,
         s=50,
         edgecolor='black',
         linewidth=0.5,
-        zorder = 5, legend=False
+        zorder = 5, legend=True
     )
-    
-    # plt.xlim(-6,6)
-    # plt.ylim(-6,6)
     
     texts = []
     for i, row in top_genes.iterrows():
-        texts.append(plt.text(row['log2fc_bulk'], row['log2fc_sc'], row['names'], fontsize=12, ha='center', zorder=10, 
+        texts.append(plt.text(row['log2fc_0'], row['log2fc_1'], row['Symbol'], fontsize=12, ha='center', zorder=10, 
                               bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2', edgecolor='none')))
     
     # Use adjust_text to prevent labels from overlapping
     adjust_text(texts, arrowprops=dict(arrowstyle='-', color='black', lw=0.5))
     
     # Add lines for reference
-    plt.plot(merged_df["log2fc_bulk"], intercept + slope*merged_df["log2fc_bulk"], 'r', label='Fitted line')
+    plt.plot(merged_df["log2fc_0"], intercept + slope*merged_df["log2fc_0"], 'r', label='Fitted line')
     plt.axhline(0, color='gray', linestyle='--', zorder=0)
     plt.axvline(0, color='gray', linestyle='--', zorder=1)
     plt.text(0.05, 0.95, f'$R^2 = {r_squared:.4f}$\n y = {intercept:.2f} + x * {slope:.2f}', transform=plt.gca().transAxes, fontsize=12,
          verticalalignment='top')
 
-    plt.xlabel('in vitro iMGLs - TGFB1 vs. + TGFB1 (log2FC)', fontsize=12)
-    plt.ylabel('in vivo xBAM vs. xMGLs (log2FC)', fontsize=12)
-    plt.savefig(f"figures/correlation_{plot_name}.png")
-    plt.savefig(f"figures/correlation_{plot_name}.svg")
+    plt.xlabel(f'{conditions[0]} (log2FC)', fontsize=12)
+    plt.ylabel(f'{conditions[1]} (log2FC)', fontsize=12)
+    # plt.savefig(f"figures/correlation_{plot_name}.png")
+    # plt.savefig(f"figures/correlation_{plot_name}.svg")
     plt.show()
     return merged_df, (upregulated_dict, downregulated_dict)
+
+def get_venn_regions(data_dict: dict) -> dict:
+    """
+    Calculates the exclusive items for every possible intersection of keys in a dictionary.
+
+    Args:
+        data_dict: A dictionary where keys are identifiers and values are lists of items.
+
+    Returns:
+        A dictionary where keys are strings representing the combination of input keys
+        (e.g., "A & B") and values are the sets of items found only in that
+        specific combination.
+    """
+    # Convert lists to sets for efficient operations
+    sets = {key: set(value) for key, value in data_dict.items()}
+    all_keys = list(sets.keys())
+    results = {}
+
+    # Generate the power set of keys (all combinations from size 1 up to all keys)
+    key_combinations = chain.from_iterable(
+        combinations(all_keys, r) for r in range(1, len(all_keys) + 1)
+    )
+
+    for combo in key_combinations:
+        # Find the intersection of all sets in the current combination
+        in_group = [sets[k] for k in combo]
+        intersection = set.intersection(*in_group)
+
+        # Find the union of all sets NOT in the current combination
+        out_group_keys = [k for k in all_keys if k not in combo]
+        out_group = [sets[k] for k in out_group_keys]
+        # Use an empty set as the start value for union
+        union_of_others = set.union(set(), *out_group)
+
+        # The exclusive items are those in the intersection minus those in any other set
+        exclusive_items = intersection - union_of_others
+
+        # Only add non-empty sets to the results
+        if exclusive_items:
+            result_key = ' & '.join(sorted(combo))
+            results[result_key] = list(exclusive_items)
+
+    return results
+
+def show_off(
+    metadata: pd.DataFrame,
+    highlight_genes: dict,
+    palette: dict = None,
+    conditions: list = None,
+    available_metadata_columns: list = ["Condition", "Experiment"]
+    
+):
+    if conditions is None:
+        try:
+            conditions = list(metadata[available_metadata_columns[0]].cat.categories)
+        except AttributError:
+            conditions = list(set(metadata[available_metadata_columns[0]]))
+    if palette is None:
+        palette = _get_color_palette(conditions)
+    
+    dds, results = get_dds_results(
+        metadata = metadata,
+        ref_condition=conditions[0]
+    )
+
+    plot_tpm_bar(
+        dds = dds,
+        conditions = conditions,
+        genes = list(highlight_genes.values())[0],
+        palette = palette,
+        plot_points = True
+    )
+
+    expression_df, row_clusters = plot_expression_heatmap(
+        metadata = metadata,
+        dds_dict = (dds, results),
+        highlight_genes=highlight_genes,
+        palette = palette,
+        available_metadata_columns = [available_metadata_columns[0]],
+        ref_condition=conditions[0],
+        n_row_clusters=2
+    )
+    
+    plot_go(
+        row_clusters
+    )
+
+    plot_tpm_curve(
+        dds = dds,
+        palette = palette,
+        highlight_genes = highlight_genes,
+        conditions = conditions
+    )
+    plot_tpm_curve_comparison(
+        dds = dds,
+        conditions = conditions,
+        highlight_genes = highlight_genes,
+        palette = palette
+    )
+
+    plot_volcano(
+        deseq_results = results[conditions[1]],
+        contrast = [conditions[0], conditions[1]],
+        highlight_genes=highlight_genes,
+        palette=palette
+    )
+
+    plot_go_enrichment(
+        deseq_results = results[conditions[1]],
+        contrast = [conditions[0], conditions[1]],
+        palette = palette
+    )
+
+    return dds, results, palette
