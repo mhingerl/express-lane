@@ -1,17 +1,19 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
-import PyComplexHeatmap as pch
-import gseapy as gp
-import scanpy as sc
 import os
+import seaborn as sns
 
-# Import libraries for analysis
+import gseapy as gp
+import PyComplexHeatmap as pch
+import random
+import scanpy as sc
+
+import matplotlib.colors as mcolors
+
 from adjustText import adjust_text
 from gprofiler import GProfiler
 from itertools import chain, combinations
-import matplotlib.colors as mcolors
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
 from pytximport import tximport
@@ -19,7 +21,6 @@ from pytximport.utils import create_transcript_gene_map
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.default_inference import DefaultInference
 from pydeseq2.ds import DeseqStats
-import random
 from sanbomics.tools import id_map
 from scipy.cluster.hierarchy import linkage, cut_tree, leaves_list
 from scipy.spatial.distance import pdist
@@ -29,7 +30,11 @@ from scipy import stats
 from typing import Dict, List, Tuple, Optional, Any
 from venn import generate_petal_labels, draw_venn, generate_colors
 
-def custom_slicer(df, initial_rows=50, block_size=50, step = 3):
+def custom_slicer(
+    df, 
+    initial_rows=50, 
+    block_size=50, 
+    step = 3):
   """
   Selects rows using a dynamic stepping pattern.
 
@@ -324,7 +329,7 @@ def plot_volcano(
     text_df = plot_df[
         (abs(plot_df['log2FoldChange']) >= log2fc_cutoff) & (plot_df[p_value_col] < p_value_cutoff)
     ].copy()
-    text_df["plot_stat"] = abs(text_df["stat"])*(text_df["log2FoldChange"]**2)
+    text_df["plot_stat"] = abs(text_df["stat"])*abs(text_df["log2FoldChange"])
     text_df = text_df.sort_values("plot_stat", key=abs, ascending=False)
 
     if hard_stop:
@@ -388,8 +393,8 @@ def plot_expression_heatmap(
     include: Optional[Dict[str, List[Any]]] = None,
     exclude: Optional[Dict[str, List[Any]]] = None,
     plot_name: str = None,
-    design_formula: str = "~Condition",
-    contrast_design = "Condition", 
+    design_formula: str = None,
+    contrast_design = None, 
     ref_condition = "Untreated", 
     p_value_cutoff: float = 0.05,
     p_value_col: str = "padj",
@@ -401,6 +406,7 @@ def plot_expression_heatmap(
     n_row_clusters=None,
     display_top_genes = 1000000, 
     add_left_ha_dict = None, 
+    plot_not_significant: bool = True,
     figure_size=(8, 14), 
     column_annotations: Optional[List[str]] = None,
     plot_formats: List[str] = ["png"],
@@ -474,6 +480,10 @@ def plot_expression_heatmap(
               values are their assigned cluster IDs. Returns None if clustering
               was not performed.
     """
+    if design_formula is None:
+        design_formula = f"~{available_metadata_columns[0]}"
+    if contrast_design is None:
+        contrast_design = available_metadata_columns[0]
     
     if column_annotations is None:
         column_annotations = [available_metadata_columns[-1], available_metadata_columns[0]]
@@ -524,7 +534,10 @@ def plot_expression_heatmap(
     # --- 4. Gene Selection for Heatmap ---
     # Assuming stimulation_colors and experiment_colors are globally available
     primary_column_order = [cond for cond in palette if cond in set(metadata[available_metadata_columns[0]])]
-    
+
+    if plot_not_significant and len(set(dds.obs[available_metadata_columns])):
+        p_value_cutoff = p_value_cutoff * 2
+        
     significant_genes_df = _get_significant_genes(
         res_dict, p_value_cutoff, p_value_col, log2fc_cutoff, contrast_design, primary_column_order, display_top_genes
     )
@@ -607,6 +620,23 @@ def plot_expression_heatmap(
             left_ha_dict[col] = pch.anno_simple(pd.Series(left_ha_df, index=expression_df.index), 
                                                         colors= left_ha_dict_color,
                                                         legend=True, add_text=False, text_kws={'fontsize':9,'color':'black'}, height = 10)
+
+    if plot_not_significant and len(set(dds.obs[available_metadata_columns[0]])) == 2:
+        res = list(res_dict.values())[0]
+        left_ha_pval_series = pd.Series(res[p_value_col], index=res["Symbol"])
+        left_ha_pval_series = left_ha_pval_series.replace([-np.inf], 0)
+        sig_cmap = LinearSegmentedColormap.from_list(
+                "sig_coolwarm",
+                [(0, "white"), (p_value_cutoff/2, "yellow"), (p_value_cutoff, "red"), (1, "red")]
+        )
+        left_ha_dict["Significance"] = pch.anno_simple(
+            left_ha_pval_series,
+            cmap = sig_cmap,
+            legend=True, 
+            add_text=False, 
+            text_kws={'fontsize':9,'color':'black'}, 
+            height = 10
+        )
 
     if left_ha_dict != {}:
         left_ha = pch.HeatmapAnnotation(
@@ -1122,39 +1152,55 @@ def get_dds_results(
     metadata,
     include: Optional[Dict[str, List[Any]]] = None,
     exclude: Optional[Dict[str, List[Any]]] = None, 
-    design_variable="~Condition",
-    contrast_design = "Condition", 
+    design_formula=None,
+    contrast_design = None, 
     ref_condition = "Untreated",
     data_base_path = "..",
-    transcriptome_species="human"
+    transcriptome_species=["human"],
+    available_metadata_columns = ["Condition"]
 ):
+    if design_formula is None:
+        design_formula = f"~{available_metadata_columns[0]}"
+    if contrast_design is None:
+        contrast_design = available_metadata_columns[0]
+        
     # --- 1. Data Loading and Preparation ---
-    metadata["xp_cond"] = [f"{i['Experiment']}_{i['Condition']}" for _, i in metadata.iterrows()]
+    metadata["xp_cond"] = [f"{i[available_metadata_columns[0]]}_{i[available_metadata_columns[-1]]}" for _, i in metadata.iterrows()]
     if include is not None:
         for k, v in include.items():
             metadata = metadata[metadata[k].isin(v)]
     if exclude is not None:
         for k, v in exclude.items():
             metadata = metadata[~metadata[k].isin(v)]
-
+            
     metadata.index = metadata["sample"]
     metadata["file_path"] = [f"{data_base_path}/{row['batch']}/1_salmon-processing/3_salmon-output/{row['sample'].split(' ')[-1]}/quant.sf" for _, row in metadata.iterrows()]
 
-    transcript_gene_map = create_transcript_gene_map(species=transcriptome_species)
+    transcript_gene_map = []
+    for transcriptome_spec in transcriptome_species:
+        map_df = create_transcript_gene_map(species=transcriptome_spec, target_field ="external_gene_name")
+        if len(transcriptome_species)>1:
+            map_df["transcript_id"] = [f"hg-{name}" if name[:4] == "ENST" else f"mm-{name}" for name in map_df["transcript_id"]]
+        transcript_gene_map.append(map_df)
+
+    transcript_gene_map = pd.concat(transcript_gene_map)
     tx_results = tximport(metadata["file_path"], data_type="salmon", transcript_gene_map=transcript_gene_map)
-    
+        
     counts_df = pd.DataFrame(tx_results.X, index=metadata.index, columns=tx_results.var_names).T
     counts_df = counts_df[counts_df.sum(axis=1) > 0].T.astype(int)
     
-    mapper = id_map(species=transcriptome_species)
-    counts_df.columns = counts_df.columns.map(mapper.mapper)
+    # mapper = id_map(species=transcriptome_species)
+    # print(mapper)
+    # counts_df.columns = counts_df.columns.map(mapper.mapper)
     counts_df = counts_df.loc[:, ~counts_df.columns.duplicated(keep='first')]
     counts_df = counts_df.groupby(counts_df.columns, axis=1).sum()
 
     # --- 2. DESeq2 Analysis ---
     dds, res_dict, contrast_design = _run_deseq_analysis(
-        counts_df, metadata, design_variable, contrast_design, ref_condition
+        counts_df, metadata, design_formula, contrast_design, ref_condition
     )
+
+    dds.layers["tpm_counts"] = pd.DataFrame(dds.T.div(dds.sum(axis=1))*1000000).T
     
     return dds, res_dict
 
@@ -1166,7 +1212,8 @@ def plot_venns(
     p_value_cutoff = 0.05,
     p_value_col = "padj",
     log2fc_cutoff = (-1,1),
-    plot_formats = ["png"]):
+    plot_formats = ["png"]
+):
 
     significant_genes_down = {}
     for key, df in plot_dict.items():
@@ -1393,11 +1440,15 @@ def plot_tpm_bar(
     plot_points: bool = False,
     condition_col: str = "Condition",
     normalize_to_first: bool = True,
+    normed_counts = None,
     plot_name = None,
     plot_formats: list[str]=["png"]
 ):
     # --- Data Preparation ---
-    expression_df = pd.DataFrame(dds.X.T, columns=dds.obs["sample"], index=dds.var_names)
+    if normed_counts is not None:
+        expression_df = pd.DataFrame(dds.layers[normed_counts].T, columns=dds.obs["sample"], index=dds.var_names)
+    else:
+        expression_df = pd.DataFrame(dds.X.T, columns=dds.obs["sample"], index=dds.var_names)
 
     genes = [gene for gene in genes if gene in dds.var_names]
     
@@ -1503,7 +1554,7 @@ def plot_go_enrichment(
     n_top_terms: int = 10,
     lfc_range: tuple = (-1.5, 1.5),
     figure_size: tuple = (10, 8),
-    plot_formats: list = [],
+    plot_formats: list = ["png"],
     go_organism = "hsapiens",
     go_sources=['GO:BP']
     
@@ -1616,7 +1667,7 @@ def plot_logfc_correlation(
     log2fc_cutoff: tuple = ((-1,1),(-1,1)),
     label_top_genes: int = 20,
     plot_name: str = None,
-    plot_format: list[str] = [],
+    plot_formats: list[str] = ["png"],
     figure_size: tuple = (7, 5)
 ):
     for i, deg_df in enumerate(deg_dfs):
@@ -1759,8 +1810,13 @@ def plot_logfc_correlation(
 
     plt.xlabel(f'{conditions[0]} (log2FC)', fontsize=12)
     plt.ylabel(f'{conditions[1]} (log2FC)', fontsize=12)
-    # plt.savefig(f"figures/correlation_{plot_name}.png")
-    # plt.savefig(f"figures/correlation_{plot_name}.svg")
+    
+    if plot_name is not None:
+        save_dir = "figures"
+        os.makedirs(save_dir, exist_ok=True)
+        for plot_format in plot_formats:
+            plt.savefig(f"{save_dir}/correlation_{plot_name}_{conditions[0]}vs{conditions[1]}.{plot_format}", dpi=300)
+            
     plt.show()
     return merged_df, (upregulated_dict, downregulated_dict)
 
@@ -1814,7 +1870,9 @@ def show_off(
     conditions: list = None,
     available_metadata_columns: list = ["Condition"],
     plot_name:str = None,
-    plot_formats: list = []
+    plot_formats: list = [],
+    ref_condition: str = "Untreated",
+    transcriptome_species = ["human"]
     
 ):
     if conditions is None:
@@ -1830,7 +1888,9 @@ def show_off(
     
     dds, results = get_dds_results(
         metadata = metadata,
-        ref_condition=conditions[0]
+        ref_condition=conditions[0],
+        available_metadata_columns = available_metadata_columns,
+        transcriptome_species = transcriptome_species
     )
 
     plot_tpm_bar(
@@ -1840,7 +1900,8 @@ def show_off(
         palette = palette,
         plot_points = True,
         plot_name = plot_name,
-        plot_formats = plot_formats
+        plot_formats = plot_formats,
+        condition_col = available_metadata_columns[0]
     )
     
     expression_df, row_clusters = plot_expression_heatmap(
@@ -1892,7 +1953,8 @@ def show_off(
         highlight_genes = highlight_genes,
         conditions = conditions,
         plot_name = plot_name,
-        plot_formats = plot_formats
+        plot_formats = plot_formats,
+        condition_col = available_metadata_columns[0]
     )
     
     plot_tpm_curve_comparison(
@@ -1901,7 +1963,8 @@ def show_off(
         highlight_genes = highlight_genes,
         palette = palette,
         plot_name = plot_name,
-        plot_formats = plot_formats
+        plot_formats = plot_formats,
+        condition_col = available_metadata_columns[0]
     )
 
     for cond in conditions[1:]:
